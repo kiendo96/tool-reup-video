@@ -85,6 +85,7 @@ def _pipeline_worker(
                 engine_type=settings.get("tts_engine", "edge"),
                 voice=settings["voice"],
                 workspace_dir=workspace_dir,
+                max_speed_increase=settings.get("max_speed_increase", 50),
                 process_manager=pm
             )
         if start_from <= 4 and end_at >= 4:
