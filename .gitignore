@@ -1,0 +1,103 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.*
+
+# Logs
+*.log
+logs/
+app.log
+
+# Runtime workspace / generated media
+workspace/
+outputs/
+output/
+temp/
+tmp/
+cache/
+*.tmp
+
+# Local databases / caches
+*.db
+*.sqlite
+*.sqlite3
+cache.db
+
+# Models / large AI artifacts
+models/
+*.bin
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.gguf
+
+# Video/audio generated or uploaded files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.srt
+*.ass
+*.vtt
+
+# Keep sample assets if explicitly placed here
+!samples/**
+!examples/**
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Backups
+_backups/
+*_backup/
+*_backup_*/
+
+# Bundled binaries / third-party tools
+bin/
+

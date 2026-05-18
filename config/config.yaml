@@ -1,0 +1,22 @@
+app:
+  name: "ViralLocal"
+  version: "0.2.0"
+  debug: false
+
+pipeline:
+  whisper_model: "base"
+  batch_size: 30
+  context_size: 5
+
+tts:
+  default_voice: "vi-VN-HoaiMyNeural"
+  max_speed_increase: 50
+
+render:
+  bgm_volume: 0.05
+  fast_preview: true
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "app.log"
