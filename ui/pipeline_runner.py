@@ -72,9 +72,12 @@ def _pipeline_worker(
             translator = TranscriptionTranslator(
                 translator_type=settings["translator_type"],
                 api_key=settings["api_key"],
-                whisper_model_size="base",
+                whisper_model_size=settings.get("whisper_model", "medium"),
                 translation_model=settings["model_name"],
                 workspace_dir=workspace_dir,
+                batch_size=settings.get("batch_size", 20),
+                context_size=settings.get("context_size", 5),
+                source_language=settings.get("source_language", "zh"),
                 process_manager=pm
             )
         if start_from <= 3 and end_at >= 3:
