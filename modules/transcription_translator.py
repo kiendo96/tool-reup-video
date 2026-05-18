@@ -6,7 +6,8 @@ from tqdm import tqdm
 from faster_whisper import WhisperModel
 
 from utils.logger import setup_logger
-from utils.transcription_utils import CacheManager, TranslatorFactory, contains_chinese
+from utils.transcription_utils import CacheManager, TranslatorFactory, contains_chinese, is_bad_translation
+from utils.srt_utils import write_srt
 
 if TYPE_CHECKING:
     from core.process_manager import ProcessManager
@@ -30,6 +31,7 @@ class TranscriptionTranslator:
         compute_type: str = "float16",
         batch_size: int = 30,  # Số câu mỗi lần dịch
         context_size: int = 5,  # Số câu ngữ cảnh gửi kèm (overlap)
+        source_language: str = "zh",
         process_manager: Optional["ProcessManager"] = None
     ):
         self.workspace_dir = Path(workspace_dir)
@@ -52,6 +54,7 @@ class TranscriptionTranslator:
         
         self.batch_size = batch_size
         self.context_size = context_size
+        self.source_language = None if source_language == "auto" else source_language
 
         logger.info(f"Đang tải model Faster-Whisper ({whisper_model_size})...")
         try:
@@ -75,20 +78,23 @@ class TranscriptionTranslator:
         if self.pm:
             self.pm.check_stop_and_raise()
 
-    def _format_time(self, seconds: float) -> str:
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        millis = int((seconds - int(seconds)) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
     def export_srt(self, segments: List[Dict], output_path: str):
-        with open(output_path, 'w', encoding='utf-8') as f:
-            for i, seg in enumerate(segments, 1):
-                start = self._format_time(seg["start"])
-                end = self._format_time(seg["end"])
-                text = seg.get("text_vi", "").strip() or seg.get("text_zh", "")
-                f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        write_srt(segments, output_path, text_key="text_vi")
+
+    def _retry_bad_translation(self, item: Dict, context: List[Dict]) -> str:
+        """Retry one bad translation item with strict prompt."""
+        if not self.translator:
+            return item.get("text_zh", "")
+        try:
+            self._check_stop()
+            retry_text = self.translator.translate_single(item, context_chunk=context)
+            if not is_bad_translation(item.get("text_zh", ""), retry_text):
+                logger.info(f"Đã sửa bản dịch lỗi cho câu #{item.get('id')}")
+                return retry_text
+            logger.warning(f"Retry vẫn lỗi cho câu #{item.get('id')}: {retry_text[:80]}")
+        except Exception as e:
+            logger.warning(f"Retry dịch câu #{item.get('id')} thất bại: {e}")
+        return "[Lỗi dịch thuật]"
 
     def process_file(self, audio_path: str) -> Optional[List[Dict]]:
         if not os.path.exists(audio_path):
@@ -106,10 +112,16 @@ class TranscriptionTranslator:
             logger.info(f"Bắt đầu ASR cho {os.path.basename(audio_path)}...")
             try:
                 self._check_stop()
-                segments, info = self.asr_model.transcribe(
-                    audio_path, language="zh", task="transcribe",
-                    vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500)
+                transcribe_kwargs = dict(
+                    language=self.source_language,
+                    task="transcribe",
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    beam_size=5,
+                    condition_on_previous_text=True,
+                    word_timestamps=True,
                 )
+                segments, info = self.asr_model.transcribe(audio_path, **transcribe_kwargs)
                 segments_zh = []
                 for i, s in enumerate(segments, 1):
                     self._check_stop()
@@ -154,7 +166,7 @@ class TranscriptionTranslator:
         for s in segments_zh:
             cached_vi = self.cache_manager.get_translation_cache(s["text_zh"])
             # Chỉ dùng cache nếu bản dịch không chứa tiếng Trung
-            if cached_vi and not contains_chinese(cached_vi):
+            if cached_vi and not is_bad_translation(s["text_zh"], cached_vi):
                 final_results.append({**s, "text_vi": cached_vi})
             else:
                 to_translate_queue.append(s)
@@ -186,19 +198,25 @@ class TranscriptionTranslator:
                 
                 for item in chunk:
                     vi_text = vi_map.get(item["id"], "[Lỗi dịch thuật]")
+                    if is_bad_translation(item.get("text_zh", ""), vi_text):
+                        logger.warning(f"Bản dịch lỗi cho câu #{item.get('id')}, retry từng câu...")
+                        vi_text = self._retry_bad_translation(item, context)
                     translated_item = {**item, "text_vi": vi_text}
                     final_results.append(translated_item)
                     # Lưu cache nếu dịch sạch
-                    if vi_text != "[Lỗi dịch thuật]" and not contains_chinese(vi_text):
+                    if not is_bad_translation(item.get("text_zh", ""), vi_text):
                         self.cache_manager.set_translation_cache(item["text_zh"], vi_text)
                         
             except Exception as e:
                 from core.process_manager import ProcessStoppedException
                 if isinstance(e, ProcessStoppedException):
                     raise
-                logger.error(f"Lỗi khi dịch Batch: {e}")
+                logger.error(f"Lỗi khi dịch Batch: {e}. Sẽ retry từng câu.")
                 for item in chunk:
-                    final_results.append({**item, "text_vi": "[Lỗi Batch]"})
+                    vi_text = self._retry_bad_translation(item, context)
+                    final_results.append({**item, "text_vi": vi_text})
+                    if not is_bad_translation(item.get("text_zh", ""), vi_text):
+                        self.cache_manager.set_translation_cache(item["text_zh"], vi_text)
 
         # Sắp xếp lại theo đúng thứ tự thời gian
         final_results.sort(key=lambda x: x["id"])

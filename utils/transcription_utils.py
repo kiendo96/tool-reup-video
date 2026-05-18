@@ -1,7 +1,6 @@
 import sqlite3
 import json
 import hashlib
-import os
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -69,12 +68,32 @@ class CacheManager:
 
 def contains_chinese(text: str) -> bool:
     """Kiểm tra xem đoạn văn có chứa ký tự tiếng Trung hay không."""
-    return bool(re.search(r'[\u4e00-\u9fff]', text))
+    return bool(re.search(r'[\u4e00-\u9fff]', text or ""))
+
+def normalize_text(text: str) -> str:
+    """Normalize text for simple equality/quality checks."""
+    text = (text or "").strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+    return text
+
+def is_bad_translation(source_text: str, translated_text: str) -> bool:
+    """Detect outputs that should be retried instead of cached/used."""
+    src = (source_text or "").strip()
+    out = (translated_text or "").strip()
+    if not out:
+        return True
+    if out.startswith("[Lỗi") or out in {"...", ".", "-"}:
+        return True
+    if contains_chinese(out):
+        return True
+    if src and normalize_text(src) == normalize_text(out):
+        return True
+    return False
 
 def _extract_json_array(text: str) -> List[Dict]:
     """Cố gắng trích xuất mảng JSON từ output của AI."""
-    text = text.strip()
-    # Tìm vùng chứa dấu ngoặc vuông []
+    text = (text or "").strip()
     start = text.find('[')
     end = text.rfind(']') + 1
     if start != -1 and end > 0:
@@ -83,9 +102,8 @@ def _extract_json_array(text: str) -> List[Dict]:
             return json.loads(json_str)
         except json.JSONDecodeError:
             try:
-                # Clean JSON bị lỗi do escape char hoặc thiếu ngoặc (cố gắng sửa cơ bản)
                 return json.loads(re.sub(r'\\(?!"|u|n|r|t|b|f)', r'\\\\', json_str))
-            except:
+            except Exception:
                 logger.error(f"Không thể parse JSON từ AI output: {text[:200]}...")
                 return []
     return []
@@ -95,97 +113,109 @@ class BaseTranslator(ABC):
     def translate_batch(self, chunk_to_translate: List[Dict], context_chunk: List[Dict] = None) -> List[Dict]:
         pass
 
+    @abstractmethod
+    def translate_single(self, item: Dict, context_chunk: List[Dict] = None) -> str:
+        pass
+
 class GeminiTranslator(BaseTranslator):
     def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
         if not api_key:
             raise ValueError("Cần có API Key để sử dụng Gemini.")
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model_name)
-        
         self.system_prompt = (
-            "Bạn là một chuyên gia dịch thuật video TikTok/Douyin (Trung -> Việt). "
-            "YÊU CẦU QUAN TRỌNG:\n"
-            "1. Dịch tự nhiên, ngắn gọn, giữ đúng tone giọng hội thoại, bắt trend tốt.\n"
-            "2. Tôi sẽ cung cấp dữ liệu JSON. Bạn chỉ được trả về MẢNG JSON duy nhất.\n"
-            "3. Giữ nguyên 'id' của từng câu.\n"
-            "4. Thêm trường 'text_vi' là bản dịch tiếng Việt.\n"
-            "5. TUYỆT ĐỐI KHÔNG giải thích, không thêm chữ gì ngoài mảng JSON.\n"
-            "6. KHÔNG được trả lại tiếng Trung. Mọi từ ngữ phải được chuyển sang Tiếng Việt.\n"
-            "Định dạng ví dụ: [{\"id\": 1, \"text_vi\": \"...\"}, ...]"
+            "Bạn là chuyên gia dịch phụ đề video TikTok/Douyin từ tiếng Trung sang tiếng Việt.\n"
+            "YÊU CẦU BẮT BUỘC:\n"
+            "1. Dịch tự nhiên, ngắn gọn, dễ đọc khi hiện trên video.\n"
+            "2. Với video bán hàng/review/livestream, dùng giọng Việt tự nhiên, có sức bán hàng nhưng không lố.\n"
+            "3. Không giải thích, không thêm markdown, không thêm lời dẫn.\n"
+            "4. Không được copy tiếng Trung gốc. Nếu source có chữ Trung, output vẫn phải là tiếng Việt.\n"
+            "5. Giữ đúng id và trả về đúng mảng JSON: [{\"id\": 1, \"text_vi\": \"...\"}].\n"
+            "6. Không bỏ sót câu ngắn. Không gộp/tách id."
         )
+
+    def _build_prompt(self, chunk_to_translate: List[Dict], context_chunk: List[Dict] = None, strict: bool = False) -> str:
+        prompt = self.system_prompt + "\n\n"
+        if context_chunk:
+            ctx_simplified = [{"id": item.get("id"), "text_vi": item.get("text_vi", "")} for item in context_chunk]
+            prompt += "--- NGỮ CẢNH ĐÃ DỊCH, CHỈ ĐỂ HIỂU MẠCH ---\n"
+            prompt += json.dumps(ctx_simplified, ensure_ascii=False) + "\n\n"
+        simplify_chunk = [{"id": item["id"], "text_zh": item.get("text_zh", "")} for item in chunk_to_translate]
+        prompt += "--- DANH SÁCH CẦN DỊCH, BẮT BUỘC TRẢ VỀ JSON CHO ĐÚNG CÁC ID NÀY ---\n"
+        prompt += json.dumps(simplify_chunk, ensure_ascii=False)
+        if strict:
+            prompt += "\n\nCẢNH BÁO: Bản trước lỗi vì còn tiếng Trung/giống source. Dịch lại 100% sang tiếng Việt tự nhiên. Chỉ trả JSON."
+        return prompt
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def translate_batch(self, chunk_to_translate: List[Dict], context_chunk: List[Dict] = None) -> List[Dict]:
         if not chunk_to_translate: return []
-            
-        prompt = self.system_prompt + "\n\n"
-        if context_chunk:
-            prompt += "--- NGỮ CẢNH TRƯỚC ĐÓ (Dùng để hiểu mạch truyện, KHÔNG ĐƯỢC DỊCH) ---\n"
-            # Chỉ lấy id và text_vi đã dịch để làm ngữ cảnh
-            ctx_simplified = [{"id": item.get("id"), "text_vi": item.get("text_vi", "")} for item in context_chunk]
-            prompt += json.dumps(ctx_simplified, ensure_ascii=False) + "\n\n"
-            
-        prompt += "--- DANH SÁCH CẦN DỊCH (BẮT BUỘC TRẢ VỀ JSON CHO CÁC ID NÀY) ---\n"
-        simplify_chunk = [{"id": item["id"], "text_zh": item["text_zh"]} for item in chunk_to_translate]
-        prompt += json.dumps(simplify_chunk, ensure_ascii=False)
-        
-        try:
-            response = self.model.generate_content(prompt)
-            if not response.text: return []
-            results = _extract_json_array(response.text)
-            
-            # --- AUTO-VERIFY & FORCE RETRY ---
-            if any(contains_chinese(res.get("text_vi", "")) for res in results):
-                logger.warning("Gemini trả về tiếng Trung, đang yêu cầu dịch lại nghiêm ngặt...")
-                force_prompt = prompt + "\n\nCẢNH BÁO: Lần trước bạn đã để lọt tiếng Trung. Lần này hãy DỊCH 100% SANG VIỆT, kể cả tên riêng!"
-                response = self.model.generate_content(force_prompt)
-                results = _extract_json_array(response.text)
-            return results
-        except Exception as e:
-            logger.warning(f"Gemini API lỗi: {str(e)}")
-            raise e
+        response = self.model.generate_content(self._build_prompt(chunk_to_translate, context_chunk))
+        results = _extract_json_array(response.text if response else "")
+        if len(results) != len(chunk_to_translate) or any(
+            is_bad_translation(item.get("text_zh", ""), next((r.get("text_vi", "") for r in results if r.get("id") == item.get("id")), ""))
+            for item in chunk_to_translate
+        ):
+            logger.warning("Gemini trả kết quả thiếu/lỗi, đang retry nghiêm ngặt...")
+            response = self.model.generate_content(self._build_prompt(chunk_to_translate, context_chunk, strict=True))
+            results = _extract_json_array(response.text if response else "")
+        return results
+
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=6), reraise=True)
+    def translate_single(self, item: Dict, context_chunk: List[Dict] = None) -> str:
+        response = self.model.generate_content(self._build_prompt([item], context_chunk, strict=True))
+        results = _extract_json_array(response.text if response else "")
+        return (results[0].get("text_vi", "") if results else "").strip()
 
 class DeepSeekTranslator(BaseTranslator):
     def __init__(self, api_key: str, model_name: str = "deepseek-chat"):
         if not api_key:
             raise ValueError("Cần có API Key để sử dụng DeepSeek.")
-        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1")
         self.model_name = model_name
         self.system_prompt = (
-            "Bạn là chuyên gia dịch video TikTok/Douyin (Trung sang Việt). "
-            "Dịch tự nhiên, ngắn gọn. CHỈ trả về mảng JSON kết quả: [{\"id\": 1, \"text_vi\": \"...\"}, ...]. "
-            "Cấm trả về tiếng Trung gốc. Dịch toàn bộ sang Tiếng Việt."
+            "Bạn là chuyên gia dịch phụ đề video TikTok/Douyin từ tiếng Trung sang tiếng Việt. "
+            "Dịch tự nhiên, ngắn gọn, dễ đọc khi hiện trên video. "
+            "Nếu là video bán hàng/review/livestream, dùng giọng Việt tự nhiên, có sức bán hàng nhưng không lố. "
+            "Không copy tiếng Trung gốc, không giải thích, không markdown. "
+            "Luôn trả về duy nhất mảng JSON: [{\"id\": 1, \"text_vi\": \"...\"}]. "
+            "Giữ đúng id, không bỏ sót, không gộp/tách câu."
         )
+
+    def _call_api(self, chunk_to_translate: List[Dict], context_chunk: List[Dict] = None, strict: bool = False) -> List[Dict]:
+        user_msg = ""
+        if context_chunk:
+            ctx = [{"id": item.get("id"), "text_vi": item.get("text_vi", "")} for item in context_chunk]
+            user_msg += f"Ngữ cảnh đã dịch, chỉ để hiểu mạch: {json.dumps(ctx, ensure_ascii=False)}\n\n"
+        simplify_chunk = [{"id": item["id"], "text_zh": item.get("text_zh", "")} for item in chunk_to_translate]
+        user_msg += "Dịch các item sau sang tiếng Việt. Chỉ trả JSON array, đúng id:\n"
+        user_msg += json.dumps(simplify_chunk, ensure_ascii=False)
+        if strict:
+            user_msg += "\n\nBản trước lỗi vì còn tiếng Trung/giống source/thiếu item. Dịch lại 100% sang tiếng Việt tự nhiên. Không giữ chữ Trung."
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "system", "content": self.system_prompt}, {"role": "user", "content": user_msg}],
+            temperature=0.2,
+            stream=False,
+        )
+        return _extract_json_array(response.choices[0].message.content)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def translate_batch(self, chunk_to_translate: List[Dict], context_chunk: List[Dict] = None) -> List[Dict]:
         if not chunk_to_translate: return []
-        
-        def _call_api(extra_prompt=""):
-            user_msg = ""
-            if context_chunk:
-                ctx = [{"id": item.get("id"), "text_vi": item.get("text_vi", "")} for item in context_chunk]
-                user_msg += f"Previous context: {json.dumps(ctx, ensure_ascii=False)}\n\n"
-            simplify_chunk = [{"id": item["id"], "text_zh": item["text_zh"]} for item in chunk_to_translate]
-            user_msg += f"Translate these to Vietnamese (STRICTLY NO CHINESE): {json.dumps(simplify_chunk, ensure_ascii=False)}"
-            if extra_prompt: user_msg += f"\n\n{extra_prompt}"
-            
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "system", "content": self.system_prompt}, {"role": "user", "content": user_msg}],
-                stream=False
-            )
-            return _extract_json_array(response.choices[0].message.content)
+        results = self._call_api(chunk_to_translate, context_chunk)
+        if len(results) != len(chunk_to_translate) or any(
+            is_bad_translation(item.get("text_zh", ""), next((r.get("text_vi", "") for r in results if r.get("id") == item.get("id")), ""))
+            for item in chunk_to_translate
+        ):
+            logger.warning("DeepSeek trả kết quả thiếu/lỗi, đang retry nghiêm ngặt...")
+            results = self._call_api(chunk_to_translate, context_chunk, strict=True)
+        return results
 
-        try:
-            results = _call_api()
-            if any(contains_chinese(res.get("text_vi", "")) for res in results):
-                logger.warning("DeepSeek trả về tiếng Trung, đang ép dịch lại...")
-                results = _call_api("ERROR: You returned Chinese. FIX IT: TRANSLATE EVERYTHING TO VIETNAMESE NOW.")
-            return results
-        except Exception as e:
-            logger.warning(f"DeepSeek API lỗi: {str(e)}")
-            raise e
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=6), reraise=True)
+    def translate_single(self, item: Dict, context_chunk: List[Dict] = None) -> str:
+        results = self._call_api([item], context_chunk, strict=True)
+        return (results[0].get("text_vi", "") if results else "").strip()
 
 class LocalTranslator(BaseTranslator):
     def __init__(self, model_name: str = "Helsinki-NLP/opus-mt-zh-vi"):
@@ -208,12 +238,15 @@ class LocalTranslator(BaseTranslator):
                 inputs = self.tokenizer(text_zh, return_tensors="pt", padding=True, truncation=True, max_length=512)
                 outputs = self.model.generate(**inputs, max_length=512)
                 res_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-                # Lọc CoT đơn giản
                 res_text = res_text.split('\n')[-1].strip()
                 results.append({"id": item["id"], "text_vi": res_text})
             except Exception:
                 results.append({"id": item["id"], "text_vi": "[Lỗi Local]"})
         return results
+
+    def translate_single(self, item: Dict, context_chunk: List[Dict] = None) -> str:
+        result = self.translate_batch([item], context_chunk=context_chunk)
+        return (result[0].get("text_vi", "") if result else "").strip()
 
 class TranslatorFactory:
     @staticmethod
