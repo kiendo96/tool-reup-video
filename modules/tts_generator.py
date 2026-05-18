@@ -6,8 +6,8 @@ from typing import List, Dict, Optional, TYPE_CHECKING
 from tqdm import tqdm
 
 from utils.logger import setup_logger
+from utils.audio_utils import align_audio_to_duration, create_silence_audio
 from utils.tts_utils import TTSFactory, get_audio_duration
-from utils.ffmpeg_utils import get_ffmpeg_path, run_ffmpeg
 
 if TYPE_CHECKING:
     from core.process_manager import ProcessManager
@@ -33,12 +33,14 @@ class TTSGenerator:
         engine_type: str = "edge",
         voice: str = "vi-VN-HoaiMyNeural",
         workspace_dir: str = "workspace",
-        process_manager: Optional["ProcessManager"] = None
+        process_manager: Optional["ProcessManager"] = None,
+        max_speed_increase: int = 50
     ):
         self.workspace_dir = Path(workspace_dir)
         self.tts_dir = self.workspace_dir / "tts_audios"
         self.tts_dir.mkdir(parents=True, exist_ok=True)
         self.pm = process_manager
+        self.max_speed_increase = max_speed_increase
         
         self.tts_engine = TTSFactory.get_engine(engine_type, voice=voice)
         logger.info(f"Khởi tạo TTSGenerator. Engine: {engine_type}, Giọng: {voice}")
@@ -59,29 +61,24 @@ class TTSGenerator:
         duration = get_audio_duration(file_path)
         return duration > 0
 
-    def _calculate_speed_rate(self, target_duration: float, actual_duration: float) -> str:
-        """
-        Tính toán tham số rate cho Edge TTS (ví dụ: '+15%') để ép file audio
-        vừa vặn vào khoảng thời gian target_duration.
-        """
-        if actual_duration <= 0 or target_duration <= 0:
-            return "+0%"
-        
-        # Nếu audio sinh ra dài hơn thời gian gốc -> Phải đọc nhanh lên
-        # Cho phép du di 0.3s (không cần ép quá gắt)
-        if actual_duration > target_duration + 0.3:
-            ratio = actual_duration / target_duration
-            # Ví dụ audio 3s, target 2s -> ratio 1.5 -> cần tăng tốc 50%
-            percent_increase = int((ratio - 1.0) * 100)
-            
-            # Giới hạn tăng tối đa 50% để tránh giọng bị méo/như sóc chuột
-            if percent_increase > 50:
-                percent_increase = 50
-                logger.debug(f"Câu quá dài, giới hạn tăng tốc ở mức +50%. (Target: {target_duration}s, Actual: {actual_duration}s)")
-                
-            return f"+{percent_increase}%"
-            
-        return "+0%"
+    def _make_silence_segment(self, seg: Dict, output_path: str, target_duration: float, reason: str) -> Dict:
+        """Create silence fallback so the timeline never has holes."""
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        ok = create_silence_audio(output_path, target_duration, process_manager=self.pm)
+        if ok:
+            seg["tts_audio_path"] = output_path
+            seg["tts_duration"] = round(get_audio_duration(output_path), 2)
+            seg["tts_target_duration"] = round(target_duration, 2)
+            seg["tts_align_action"] = "silence"
+            seg["tts_fallback_reason"] = reason
+        else:
+            seg["tts_audio_path"] = None
+            seg["tts_duration"] = 0
+            seg["tts_target_duration"] = round(target_duration, 2)
+            seg["tts_align_action"] = "failed"
+            seg["tts_fallback_reason"] = reason
+        return seg
 
     def process_transcript(self, transcript_json_path: str) -> Optional[str]:
         """
@@ -117,24 +114,37 @@ class TTSGenerator:
             self._check_stop()
             
             text_vi = seg.get("text_vi", "").strip()
-            if not text_vi or text_vi == "[Lỗi dịch thuật]" or text_vi.startswith("[Lỗi"):
-                updated_segments.append(seg)
-                continue
-                
-            target_duration = seg["end"] - seg["start"]
+            target_duration = max(0.1, float(seg.get("end", 0)) - float(seg.get("start", 0)))
             audio_filename = f"seg_{i:04d}.mp3"
             output_path = str(video_tts_dir / audio_filename)
+
+            if not text_vi or text_vi == "[Lỗi dịch thuật]" or text_vi.startswith("[Lỗi"):
+                fail_count += 1
+                logger.warning(f"Câu {i} không có text TTS hợp lệ, tạo silence fallback.")
+                updated_segments.append(self._make_silence_segment(seg, output_path, target_duration, "invalid_text"))
+                continue
             
             # --- CƠ CHẾ SMART SKIP (Cải tiến: kiểm tra file corrupted) ---
             if os.path.exists(output_path):
                 if self._is_valid_audio(output_path):
                     # File hợp lệ → skip
-                    actual_duration = get_audio_duration(output_path)
-                    seg["tts_audio_path"] = output_path
-                    seg["tts_duration"] = round(actual_duration, 2)
-                    skip_count += 1
-                    updated_segments.append(seg)
-                    continue
+                    ok, final_duration, action = align_audio_to_duration(
+                        output_path,
+                        output_path,
+                        target_duration,
+                        max_speed_increase=self.max_speed_increase,
+                        process_manager=self.pm,
+                    )
+                    if ok:
+                        seg["tts_audio_path"] = output_path
+                        seg["tts_duration"] = round(final_duration, 2)
+                        seg["tts_target_duration"] = round(target_duration, 2)
+                        seg["tts_align_action"] = f"cached+{action}" if action != "original" else "cached"
+                        skip_count += 1
+                        updated_segments.append(seg)
+                        continue
+                    logger.warning(f"File cache không align được, đang tạo lại: {audio_filename}")
+                    os.remove(output_path)
                 else:
                     # File corrupted → xóa và tạo lại
                     logger.warning(f"File corrupted, đang tạo lại: {audio_filename}")
@@ -147,47 +157,32 @@ class TTSGenerator:
             success = self.tts_engine.generate_audio(text_vi, output_path, rate="+0%")
             
             if success and self._is_valid_audio(output_path):
-                actual_duration = get_audio_duration(output_path)
-                rate = "+0%"
-                # Tính rate và sinh lại nếu cần (dài hơn target + 0.3s)
-                if actual_duration > target_duration + 0.3 and target_duration > 0:
-                    ratio = actual_duration / target_duration
-                    if ratio > 1.5:
-                        ratio = 1.5
-                    percent_increase = int((ratio - 1.0) * 100)
-                    rate = f"+{percent_increase}%"
-                    
-                    # Dùng FFmpeg atempo để tăng tốc độ thay vì gọi lại API Edge TTS (giảm 50% request)
-                    temp_output = output_path + ".temp.mp3"
-                    if os.path.exists(temp_output):
-                        os.remove(temp_output)
-                    
-                    cmd = [
-                        get_ffmpeg_path(), "-y",
-                        "-i", output_path,
-                        "-filter:a", f"atempo={ratio:.2f}",
-                        temp_output
-                    ]
-                    
-                    res = run_ffmpeg(cmd, process_manager=self.pm, description="Speed up TTS Audio")
-                    if res.returncode == 0 and os.path.exists(temp_output) and get_audio_duration(temp_output) > 0:
-                        os.replace(temp_output, output_path)
-                        actual_duration = get_audio_duration(output_path)
-                    else:
-                        logger.error(f"Lỗi FFmpeg khi tăng tốc audio cho câu {i}. Giữ nguyên audio gốc.")
-                        if os.path.exists(temp_output):
-                            os.remove(temp_output)
-                
-                seg["tts_audio_path"] = output_path
-                seg["tts_duration"] = round(actual_duration, 2)
-                seg["tts_rate_applied"] = rate
+                ok, final_duration, action = align_audio_to_duration(
+                    output_path,
+                    output_path,
+                    target_duration,
+                    max_speed_increase=self.max_speed_increase,
+                    process_manager=self.pm,
+                )
+                if ok:
+                    seg["tts_audio_path"] = output_path
+                    seg["tts_duration"] = round(final_duration, 2)
+                    seg["tts_target_duration"] = round(target_duration, 2)
+                    seg["tts_align_action"] = action
+                    if final_duration > target_duration + 0.2:
+                        logger.warning(
+                            f"Câu {i} vẫn dài hơn slot sau align: {final_duration:.2f}s > {target_duration:.2f}s"
+                        )
+                else:
+                    fail_count += 1
+                    logger.error(f"Không align được TTS cho câu {i}, tạo silence fallback.")
+                    seg = self._make_silence_segment(seg, output_path, target_duration, "align_failed")
             else:
                 fail_count += 1
-                logger.error(f"Thất bại tạo TTS cho câu {i}: '{text_vi[:50]}...'")
-                # Xóa file corrupted nếu có
+                logger.error(f"Thất bại tạo TTS cho câu {i}: '{text_vi[:50]}...'. Tạo silence fallback.")
                 if os.path.exists(output_path):
                     os.remove(output_path)
-                seg["tts_audio_path"] = None
+                seg = self._make_silence_segment(seg, output_path, target_duration, "tts_failed")
                 
             updated_segments.append(seg)
             

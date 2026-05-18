@@ -7,7 +7,8 @@ from core.process_manager import ProcessManager
 from ui.sidebar import render_sidebar
 from ui.pipeline_runner import start_pipeline_thread
 from utils.logger import setup_logger
-from utils.project_manager import ensure_project, import_project_folder, list_projects, slugify_project_name
+from utils.project_manager import ensure_project, import_project_folder, list_projects
+from utils.srt_utils import merge_origin_target_srt
 
 logger = setup_logger(__name__)
 
@@ -174,8 +175,88 @@ def main():
         _render_transcript_editor(workspace_dir)
 
 
+def _save_uploaded_file(uploaded_file, dest_path: Path) -> Path:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return dest_path
+
+
+def _render_srt_importer(workspace_dir: str):
+    with st.expander("📥 Import SRT / KrillinAI output", expanded=False):
+        workspace = Path(workspace_dir)
+        upload_dir = workspace / "uploads"
+        transcripts_dir = workspace / "transcripts"
+        import_dir = workspace / "imports" / "srt"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        transcripts_dir.mkdir(parents=True, exist_ok=True)
+        import_dir.mkdir(parents=True, exist_ok=True)
+
+        video_files = []
+        for pattern in ("*.mp4", "*.mov", "*.mkv", "*.webm"):
+            video_files.extend(upload_dir.glob(pattern))
+        video_files = sorted(video_files)
+
+        col_video, col_name = st.columns([1.2, 1])
+        with col_video:
+            video_options = [v.name for v in video_files]
+            selected_video = st.selectbox(
+                "Video tương ứng trong project",
+                video_options,
+                disabled=not bool(video_options),
+                help="Upload video ở khung bên trái trước, rồi import SRT cho video đó."
+            ) if video_options else ""
+        with col_name:
+            manual_stem = st.text_input(
+                "Hoặc nhập tên transcript",
+                placeholder="vd: review-kinh-mat",
+                help="Dùng khi chưa có video trong uploads. Không cần .json."
+            )
+
+        target_srt = st.file_uploader("Target SRT tiếng Việt / target_language_srt.srt", type=["srt"], key="target_srt_import")
+        origin_srt = st.file_uploader("Origin SRT tiếng Trung optional / origin_language_srt.srt", type=["srt"], key="origin_srt_import")
+        overwrite_transcript = st.checkbox("Ghi đè transcript nếu đã tồn tại", value=True)
+
+        if st.button("Import SRT vào transcript", use_container_width=True):
+            if not target_srt:
+                st.error("Cần chọn target SRT tiếng Việt.")
+                return
+
+            if manual_stem.strip():
+                video_stem = manual_stem.strip()
+            elif selected_video:
+                video_stem = Path(selected_video).stem
+            else:
+                st.error("Cần upload video vào project hoặc nhập tên transcript.")
+                return
+
+            safe_stem = "".join(c if c.isalnum() or c in "-_ ." else "_" for c in video_stem).strip().replace(" ", "-")
+            target_path = _save_uploaded_file(target_srt, import_dir / f"{safe_stem}_target.srt")
+            origin_path = _save_uploaded_file(origin_srt, import_dir / f"{safe_stem}_origin.srt") if origin_srt else None
+            output_json = transcripts_dir / f"{safe_stem}_transcript.json"
+
+            if output_json.exists() and not overwrite_transcript:
+                st.warning(f"Transcript đã tồn tại: {output_json.name}. Tick ghi đè nếu muốn thay thế.")
+                return
+
+            try:
+                import json
+                segments = merge_origin_target_srt(target_path, origin_path)
+                if not segments:
+                    st.error("Không parse được SRT hoặc SRT rỗng.")
+                    return
+                with open(output_json, "w", encoding="utf-8") as f:
+                    json.dump(segments, f, ensure_ascii=False, indent=2)
+                st.success(f"Đã import {len(segments)} dòng vào: {output_json.name}")
+                st.caption("Giờ có thể chọn 'Bắt đầu từ Bước 3' để TTS/render từ transcript này.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Import SRT thất bại: {e}")
+
+
 def _render_transcript_editor(workspace_dir: str):
     st.subheader("📝 Transcript Editor")
+    _render_srt_importer(workspace_dir)
     with st.expander("Kiểm tra/sửa kịch bản trước khi TTS", expanded=True):
         transcripts_dir = Path(workspace_dir) / "transcripts"
         transcript_files = []

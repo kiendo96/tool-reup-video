@@ -1,5 +1,5 @@
 """
-Sidebar UI — Quản lý toàn bộ giao diện thanh cấu hình bên trái.
+Sidebar UI - Quản lý toàn bộ giao diện thanh cấu hình bên trái.
 Trả về dict chứa tất cả settings người dùng đã chọn.
 """
 
@@ -190,6 +190,15 @@ def render_sidebar(workspace_dir: str = "workspace") -> dict:
             voice_choice = st.selectbox("Chọn giọng đọc:", tts_voices, index=default_voice_idx)
             final_voice = voice_choice.split(" ")[0]
 
+        max_speed_increase = st.slider(
+            "Tăng tốc TTS tối đa (%)",
+            0,
+            100,
+            50,
+            5,
+            help="Nếu giọng đọc dài hơn slot phụ đề, tool sẽ tăng tốc tối đa mức này rồi pad/silence để giữ timeline."
+        )
+
         # ─── 5. Hiệu ứng Hình ảnh ───
         st.subheader("5. Hiệu ứng Hình ảnh")
         blur_sub = st.checkbox("Che Sub Trung Quốc (Dải đen)", value=is_blur_sub)
@@ -248,6 +257,7 @@ def render_sidebar(workspace_dir: str = "workspace") -> dict:
         "context_size": context_size,
         "tts_engine": tts_engine,
         "voice": final_voice,
+        "max_speed_increase": max_speed_increase,
         "blur_sub": blur_sub,
         "blur_logo": blur_logo,
         "flip_video": flip_video,
